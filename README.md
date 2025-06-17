@@ -1,6 +1,6 @@
 # Buche Content Generator Worker
 
-AI-powered content generation worker that creates relevant erotic content based on input text and related tagged content from the database.
+AI-powered content generation worker that creates relevant erotic content based on input text and related tagged content from the database. Integrates with the **queue-based tagging system** from buche-tag-worker.
 
 ## Features
 
@@ -102,7 +102,35 @@ npm run cf-typegen
 
 This worker requires:
 - Cloudflare D1 database with tagged content
-- Cloudflare R2 bucket with content snippets
+- Cloudflare R2 bucket with content snippets  
 - Cloudflare AI binding for content generation
 - Existing content from buche-data-collect-worker
-- Tags from buche-tag-worker
+- **Tags from buche-tag-worker** (preferably processed via the new queue-based system)
+
+## Integration with Queue-Based Tagging
+
+This worker works best when content has been processed through the new **queue-based tagging system**:
+
+1. **Data Collection**: Use `buche-data-collect-worker` to collect and automatically queue content
+2. **Queue Processing**: Use `buche-tag-worker/tag-queue` to process all content with AI tags
+3. **Content Generation**: Use this worker to generate content based on the tagged corpus
+
+### Recommended Workflow
+
+```bash
+# 1. Collect content (auto-queues for tagging)
+curl -X POST https://buche-data-collect-worker.workers.dev/collect -d '{"startPage": 1, "endPage": 10}'
+
+# 2. Process all content with queue-based tagging
+curl -X POST https://buche-tag-worker.workers.dev/tag-queue
+
+# 3. Monitor tagging progress
+curl https://buche-tag-worker.workers.dev/queue-status
+
+# 4. Generate content once tagging is complete
+curl -X POST https://buche-content-generator-worker.workers.dev/generate \
+  -H "Content-Type: application/json" \
+  -d '{"content": "你的输入文本..."}'
+```
+
+The queue-based system ensures that all content is properly tagged before content generation, providing better matching and more relevant results.

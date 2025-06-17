@@ -27,6 +27,8 @@ interface ContentGenerationResponse {
 	generatedContent?: string;
 	relatedSnippets?: RelatedSnippet[];
 	detectedTags?: string[];
+	extractedCharacters?: CharacterInfo[];
+	contentSummary?: string;
 	error?: string;
 }
 
@@ -36,6 +38,13 @@ interface RelatedSnippet {
 	author: string;
 	tags: string[];
 	relevanceScore: number;
+}
+
+interface CharacterInfo {
+	name: string;
+	relationship?: string;
+	attributes: string[];
+	role?: string;
 }
 
 interface Tag {
@@ -119,19 +128,27 @@ async function handleContentGeneration(request: Request, env: Env): Promise<Resp
 			});
 		}
 		
-		// Analyze input content to detect relevant tags
+		// Step 1: Extract characters from input content
+		const extractedCharacters = await extractCharacters(body.content, env.AI);
+		
+		// Step 2: Create content summary
+		const contentSummary = await summarizeContent(body.content, env.AI);
+		
+		// Step 3: Analyze input content to detect relevant tags
 		const detectedTags = await analyzeContentForTags(body.content, env.AI);
 		
-		// Combine detected tags with provided tags
+		// Step 4: Combine detected tags with provided tags
 		const allTags = [...(body.tags || []), ...detectedTags];
 		const uniqueTags = [...new Set(allTags)];
 		
-		// Find related snippets based on tags
-		const relatedSnippets = await findRelatedSnippets(uniqueTags, env, 5);
+		// Step 5: Find related snippets based on tags (1-2 per tag with deduplication)
+		const relatedSnippets = await findRelatedSnippetsWithDedup(uniqueTags, env, 2);
 		
-		// Generate new content
-		const generatedContent = await generateContent(
+		// Step 6: Generate new content using all extracted information
+		const generatedContent = await generateContentWithContext(
 			body.content,
+			extractedCharacters,
+			contentSummary,
 			relatedSnippets,
 			uniqueTags,
 			env.AI,
@@ -148,7 +165,9 @@ async function handleContentGeneration(request: Request, env: Env): Promise<Resp
 				tags: snippet.tagNames || [],
 				relevanceScore: snippet.relevanceScore || 0
 			})),
-			detectedTags
+			detectedTags,
+			extractedCharacters,
+			contentSummary
 		};
 		
 		return new Response(JSON.stringify(response), {
@@ -193,6 +212,126 @@ async function handleStatus(env: Env): Promise<Response> {
 			status: 500,
 			headers: { 'Content-Type': 'application/json' }
 		});
+	}
+}
+
+async function extractCharacters(content: string, ai: Ai): Promise<CharacterInfo[]> {
+	try {
+		const truncatedContent = content.length > 1500 ? content.substring(0, 1500) + '...' : content;
+		
+		const prompt = `分析这段内容，提取其中的主要人物角色信息。对每个人物，提供以下信息：
+- 姓名或称呼
+- 与其他角色的关系（如：夫妻、恋人、朋友等）
+- 外貌或性格特征（3-5个关键词）
+- 在故事中的角色定位（如：主角、配角等）
+
+内容：${truncatedContent}
+
+请以JSON格式返回，格式如下：
+[
+  {
+    "name": "角色名",
+    "relationship": "关系描述",
+    "attributes": ["特征1", "特征2", "特征3"],
+    "role": "角色定位"
+  }
+]`;
+		
+		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
+			messages: [
+				{
+					role: 'user',
+					content: prompt
+				}
+			],
+			max_tokens: 300
+		}) as any;
+		
+		const result = response.response as string;
+		
+		try {
+			// Try to parse JSON response
+			const characters = JSON.parse(result) as CharacterInfo[];
+			return Array.isArray(characters) ? characters.slice(0, 5) : []; // Limit to 5 characters max
+		} catch (parseError) {
+			// If JSON parsing fails, try to extract character info manually
+			console.warn('Failed to parse character JSON, attempting manual extraction');
+			return extractCharactersManually(result);
+		}
+		
+	} catch (error) {
+		console.error('Error extracting characters:', error);
+		return [];
+	}
+}
+
+function extractCharactersManually(text: string): CharacterInfo[] {
+	const characters: CharacterInfo[] = [];
+	const lines = text.split('\n').filter(line => line.trim().length > 0);
+	
+	// Simple pattern matching for character extraction
+	for (const line of lines) {
+		if (line.includes('name') || line.includes('姓名') || line.includes('角色')) {
+			const nameMatch = line.match(/[：:]\s*([^\s，,。]+)/);
+			if (nameMatch) {
+				characters.push({
+					name: nameMatch[1],
+					attributes: [],
+					relationship: '',
+					role: ''
+				});
+			}
+		}
+	}
+	
+	return characters.slice(0, 3); // Limit to 3 characters
+}
+
+async function summarizeContent(content: string, ai: Ai): Promise<string> {
+	try {
+		const truncatedContent = content.length > 2000 ? content.substring(0, 2000) + '...' : content;
+		
+		const prompt = `请对以下内容进行总结，包含以下关键信息：
+1. 主要场景和环境设定
+2. 故事背景和时间点
+3. 主要情节发展
+4. 人物关系和互动
+5. 情感氛围和基调
+6. 叙述风格特点
+
+要求：
+- 总结长度控制在100-200字
+- 保持客观描述
+- 突出关键元素以便后续内容生成参考
+
+内容：${truncatedContent}
+
+请提供简洁的总结：`;
+		
+		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
+			messages: [
+				{
+					role: 'user',
+					content: prompt
+				}
+			],
+			max_tokens: 250
+		}) as any;
+		
+		const result = response.response as string;
+		
+		// Clean up the summary
+		const cleanedSummary = result
+			.trim()
+			.replace(/^[\"'"""'']+|[\"'"""'']+$/g, '') // Remove surrounding quotes
+			.replace(/\n{3,}/g, '\n\n') // Limit consecutive newlines
+			.substring(0, 300); // Ensure length limit
+		
+		return cleanedSummary;
+		
+	} catch (error) {
+		console.error('Error summarizing content:', error);
+		return '';
 	}
 }
 
@@ -253,6 +392,86 @@ function isValidChineseTag(tag: string): boolean {
 interface RelatedSnippetWithContent extends RelatedSnippet {
 	content?: string;
 	tagNames?: string[];
+}
+
+async function findRelatedSnippetsWithDedup(tags: string[], env: Env, snippetsPerTag: number = 2): Promise<RelatedSnippetWithContent[]> {
+	if (tags.length === 0) {
+		return [];
+	}
+	
+	try {
+		// Find tag IDs for the given tag names
+		const tagPlaceholders = tags.map(() => '?').join(',');
+		const tagQuery = `SELECT id, name FROM tags WHERE name IN (${tagPlaceholders})`;
+		const tagResults = await env.CONTENT_DB.prepare(tagQuery).bind(...tags).all();
+		
+		const foundTags = tagResults.results as unknown as Tag[];
+		if (foundTags.length === 0) {
+			return [];
+		}
+
+		const allSnippets: RelatedSnippetWithContent[] = [];
+		const seenSnippetIds = new Set<string>();
+		
+		// For each tag, find random snippets
+		for (const tag of foundTags) {
+			const snippetQuery = `
+				SELECT s.*, t.name as tag_name
+				FROM snippets s
+				JOIN snippet_tags st ON s.id = st.snippet_id
+				JOIN tags t ON st.tag_id = t.id
+				WHERE st.tag_id = ?
+				ORDER BY RANDOM()
+				LIMIT ?
+			`;
+			
+			const snippetResults = await env.CONTENT_DB.prepare(snippetQuery)
+				.bind(tag.id, snippetsPerTag * 2) // Get more than needed for deduplication
+				.all();
+			
+			for (const snippet of snippetResults.results as any[]) {
+				// Skip if already seen
+				if (seenSnippetIds.has(snippet.id)) {
+					continue;
+				}
+				
+				// Skip if we have enough for this tag
+				const tagSnippetCount = allSnippets.filter(s => 
+					s.tagNames && s.tagNames.includes(tag.name)
+				).length;
+				if (tagSnippetCount >= snippetsPerTag) {
+					continue;
+				}
+				
+				try {
+					// Get content from R2
+					const r2Object = await env.CONTENT_BUCKET.get(snippet.id);
+					if (r2Object) {
+						const content = await r2Object.text();
+						
+						allSnippets.push({
+							id: snippet.id,
+							title: snippet.title,
+							author: snippet.author,
+							tags: [tag.name],
+							content: content,
+							tagNames: [tag.name],
+							relevanceScore: 1.0 // Equal relevance for random selection
+						});
+						
+						seenSnippetIds.add(snippet.id);
+					}
+				} catch (error) {
+					console.error(`Error fetching content for snippet ${snippet.id}:`, error);
+				}
+			}
+		}
+		
+		return allSnippets;
+	} catch (error) {
+		console.error('Error finding related snippets with dedup:', error);
+		return [];
+	}
 }
 
 async function findRelatedSnippets(tags: string[], env: Env, limit: number = 5): Promise<RelatedSnippetWithContent[]> {
@@ -324,6 +543,101 @@ async function findRelatedSnippets(tags: string[], env: Env, limit: number = 5):
 	} catch (error) {
 		console.error('Error finding related snippets:', error);
 		return [];
+	}
+}
+
+async function generateContentWithContext(
+	originalContent: string,
+	extractedCharacters: CharacterInfo[],
+	contentSummary: string,
+	relatedSnippets: RelatedSnippetWithContent[],
+	detectedTags: string[],
+	ai: Ai,
+	maxLength: number = 800
+): Promise<string> {
+	try {
+		// Prepare character information
+		const charactersText = extractedCharacters.length > 0 
+			? extractedCharacters.map(char => 
+				`${char.name}：${char.relationship || '未知关系'}，特征：${char.attributes.join('、')}，角色：${char.role || '未知'}`
+			).join('\n')
+			: '(未检测到明确角色信息)';
+		
+		// Prepare related snippets text (limit to avoid token overflow)
+		const snippetsText = relatedSnippets
+			.slice(0, 4) // Use top 4 most relevant snippets
+			.map((snippet, index) => {
+				const content = snippet.content && snippet.content.length > 250 
+					? snippet.content.substring(0, 250) + '...' 
+					: snippet.content;
+				return `[参考片段${index + 1}] 《${snippet.title}》作者：${snippet.author}\n标签：${snippet.tagNames?.join('、') || ''}\n内容：${content}`;
+			})
+			.join('\n\n');
+		
+		const tagsText = detectedTags.join('、');
+		
+		const enhancedPrompt = `你是一个专业的情色文学创作助手。基于提供的详细分析信息，创作符合以下要求的后续内容：
+
+**角色信息（必须保持一致）：**
+${charactersText}
+
+**内容摘要：**
+${contentSummary}
+
+**创作要求：**
+1. **严格保持角色一致性** - 使用相同的角色名称、关系和特征
+2. **延续情节发展** - 根据摘要信息自然延续故事情节
+3. **匹配写作风格** - 保持与原文相似的叙述风格和语言特点
+4. **深化情感描述** - 加强情感层面的描写和心理活动
+5. **适度的身体描写** - 包含恰当的身体接触和感官描述
+6. **保持角色性格** - 让角色行为符合已建立的性格特征
+
+**参考内容分析：**
+- 从相关片段中学习类似情境的处理方式
+- 参考片段的叙述技巧和情感表达方式
+- 保持与参考内容类似的激情程度和表达风格
+
+**检测到的内容标签：** ${tagsText || '(无)'}
+
+**相关参考片段：**
+${snippetsText || '(无相关片段)'}
+
+**原始内容：**
+${originalContent}
+
+**输出要求：**
+- 长度：300-800字
+- 语言：流畅的中文
+- 结构：完整的段落，有清晰的情节发展
+- 内容：与原文无缝衔接，角色行为符合既定特征
+- 确保角色名称和关系完全匹配原文
+
+请基于以上详细信息创作后续内容：`;
+		
+		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
+			messages: [
+				{
+					role: 'user',
+					content: enhancedPrompt
+				}
+			],
+			max_tokens: Math.min(maxLength * 2, 1500) // Allow some buffer for Chinese tokens
+		}) as any;
+		
+		const generatedText = response.response as string;
+		
+		// Clean up the generated content
+		const cleanedContent = generatedText
+			.trim()
+			.replace(/^[\"'"""'']+|[\"'"""'']+$/g, '') // Remove surrounding quotes
+			.replace(/\n{3,}/g, '\n\n') // Limit consecutive newlines
+			.substring(0, maxLength); // Ensure length limit
+		
+		return cleanedContent;
+		
+	} catch (error) {
+		console.error('Error generating content with context:', error);
+		throw new Error('Failed to generate content with context');
 	}
 }
 
