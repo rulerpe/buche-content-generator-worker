@@ -144,9 +144,8 @@ async function handleContentGeneration(request: Request, env: Env): Promise<Resp
 		// Step 5: Find related snippets based on tags (1-2 per tag with deduplication)
 		const relatedSnippets = await findRelatedSnippetsWithDedup(uniqueTags, env, 2);
 		
-		// Step 6: Generate new content using all extracted information
+		// Step 6: Generate new content using summary and context
 		const generatedContent = await generateContentWithContext(
-			body.content,
 			extractedCharacters,
 			contentSummary,
 			relatedSnippets,
@@ -547,7 +546,6 @@ async function findRelatedSnippets(tags: string[], env: Env, limit: number = 5):
 }
 
 async function generateContentWithContext(
-	originalContent: string,
 	extractedCharacters: CharacterInfo[],
 	contentSummary: string,
 	relatedSnippets: RelatedSnippetWithContent[],
@@ -588,29 +586,26 @@ ${snippetsText || '(无相关片段)'}
 4. **场景描写手法** - 学习参考片段的环境描述、感官细节和氛围营造
 5. **情感渲染方式** - 模仿参考片段的情感描写深度和表达技巧
 
-**角色信息（必须保持原文一致）：**
+**角色信息（必须保持一致）：**
 ${charactersText}
 
-**内容摘要（延续发展）：**
+**内容摘要（作为创作基础）：**
 ${contentSummary}
-
-**原始内容：**
-${originalContent}
 
 **创作指导：**
 - **首要任务**：深度学习参考片段的写作风格，让生成内容在风格上与参考片段高度相似
-- **角色一致性**：严格使用原文中的角色名称、关系和特征，不得改变
-- **情节延续**：基于原文和摘要自然延续故事，但采用参考片段的叙述风格
-- **风格融合**：将参考片段的优秀写作技巧应用到原文角色和情节的延续中
+- **角色一致性**：严格使用摘要中的角色名称、关系和特征，不得改变
+- **情节延续**：基于内容摘要自然延续故事，但采用参考片段的叙述风格
+- **风格融合**：将参考片段的优秀写作技巧应用到摘要角色和情节的延续中
 
 **输出要求：**
 - 长度：300-800字
 - 语言：流畅的中文，风格贴近参考片段
 - 结构：完整段落，情节发展清晰
-- 内容：与原文无缝衔接，但风格向参考片段靠拢
-- 重点：让读者感觉这是参考片段作者写的原文续篇
+- 内容：基于摘要延续创作，风格向参考片段靠拢
+- 重点：让读者感觉这是参考片段作者基于摘要写的续篇
 
-请基于参考片段的风格创作后续内容：`;
+请基于内容摘要和参考片段的风格创作后续内容：`;
 		
 		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
 			messages: [
