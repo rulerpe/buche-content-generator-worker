@@ -91,7 +91,7 @@ npm run dev
 # Run tests
 npm run test
 
-# Deploy to Cloudflare
+# Deploy to Cloudflare worker
 npm run deploy
 
 # Generate TypeScript types
