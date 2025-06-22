@@ -6,12 +6,17 @@
  * - Finds relevant tagged content from database
  * - Generates new content maintaining characters and context
  * - Returns generated content that builds on the input
+ * - Supports streaming generation via WebSocket + Durable Objects
  */
+
+import { ContentGeneratorDO } from './content-generator-do';
 
 export interface Env {
 	CONTENT_BUCKET: R2Bucket;
 	CONTENT_DB: D1Database;
 	AI: Ai;
+	OPENROUTER_API_KEY: string;
+	CONTENT_GENERATOR_DO: DurableObjectNamespace;
 }
 
 interface ContentGenerationRequest {
@@ -102,13 +107,44 @@ export default {
 			return handleContentGeneration(request, env);
 		}
 		
+		if (url.pathname === '/generate-stream') {
+			return handleStreamingGeneration(request, env);
+		}
+		
 		if (url.pathname === '/status') {
 			return handleStatus(env);
 		}
 		
-		return new Response('Buche Content Generator Worker\n\nEndpoints:\n- POST /generate - Generate content based on input\n- GET /status - Check worker status');
+		return new Response('Buche Content Generator Worker\n\nEndpoints:\n- POST /generate - Generate content based on input\n- GET /generate-stream - Stream content generation via WebSocket\n- GET /status - Check worker status');
 	},
 } satisfies ExportedHandler<Env>;
+
+// Export the Durable Object class
+export { ContentGeneratorDO };
+
+async function handleStreamingGeneration(request: Request, env: Env): Promise<Response> {
+	const upgradeHeader = request.headers.get('Upgrade');
+	if (!upgradeHeader || upgradeHeader !== 'websocket') {
+		return new Response('Upgrade: websocket required', { status: 426 });
+	}
+
+	// Create a unique ID for this generation session
+	const sessionId = crypto.randomUUID();
+	const durableObjectId = env.CONTENT_GENERATOR_DO.idFromName(sessionId);
+	const durableObjectStub = env.CONTENT_GENERATOR_DO.get(durableObjectId);
+
+	// Forward the WebSocket request to the Durable Object
+	const newUrl = new URL(request.url);
+	newUrl.pathname = '/websocket';
+	
+	const newRequest = new Request(newUrl.toString(), {
+		method: request.method,
+		headers: request.headers,
+		body: request.body
+	});
+
+	return durableObjectStub.fetch(newRequest);
+}
 
 async function handleContentGeneration(request: Request, env: Env): Promise<Response> {
 	if (request.method !== 'POST') {
@@ -129,13 +165,13 @@ async function handleContentGeneration(request: Request, env: Env): Promise<Resp
 		}
 		
 		// Step 1: Extract characters from input content
-		const extractedCharacters = await extractCharacters(body.content, env.AI);
+		const extractedCharacters = await extractCharacters(body.content, env.OPENROUTER_API_KEY);
 		
 		// Step 2: Create content summary
-		const contentSummary = await summarizeContent(body.content, env.AI);
+		const contentSummary = await summarizeContent(body.content, env.OPENROUTER_API_KEY);
 		
 		// Step 3: Analyze input content to detect relevant tags
-		const detectedTags = await analyzeContentForTags(body.content, env.AI);
+		const detectedTags = await analyzeContentForTags(body.content, env.OPENROUTER_API_KEY);
 		
 		// Step 4: Combine detected tags with provided tags
 		const allTags = [...(body.tags || []), ...detectedTags];
@@ -150,7 +186,7 @@ async function handleContentGeneration(request: Request, env: Env): Promise<Resp
 			contentSummary,
 			relatedSnippets,
 			uniqueTags,
-			env.AI,
+			env.OPENROUTER_API_KEY,
 			body.maxLength || 800
 		);
 		
@@ -214,7 +250,7 @@ async function handleStatus(env: Env): Promise<Response> {
 	}
 }
 
-async function extractCharacters(content: string, ai: Ai): Promise<CharacterInfo[]> {
+async function extractCharacters(content: string, openrouterApiKey: string): Promise<CharacterInfo[]> {
 	try {
 		const truncatedContent = content.length > 1500 ? content.substring(0, 1500) + '...' : content;
 		
@@ -236,7 +272,11 @@ async function extractCharacters(content: string, ai: Ai): Promise<CharacterInfo
   }
 ]`;
 		
-		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
+		// Debug API key
+		console.log('extractCharacters - API Key length:', openrouterApiKey?.length || 0);
+		
+		const requestBody = {
+			model: 'mistralai/mistral-large-2411',
 			messages: [
 				{
 					role: 'user',
@@ -244,17 +284,43 @@ async function extractCharacters(content: string, ai: Ai): Promise<CharacterInfo
 				}
 			],
 			max_tokens: 300
-		}) as any;
+		};
 		
-		const result = response.response as string;
+		const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+			method: 'POST',
+			headers: {
+				'Authorization': `Bearer ${openrouterApiKey}`,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify(requestBody)
+		});
+		
+		if (!response.ok) {
+			const errorText = await response.text();
+			console.error('extractCharacters OpenRouter API error:', response.status, response.statusText, errorText);
+			throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
+		}
+		
+		const responseData = await response.json() as any;
+		const result = responseData.choices[0].message.content;
+		
+		console.log('Character extraction raw result:', result);
 		
 		try {
-			// Try to parse JSON response
-			const characters = JSON.parse(result) as CharacterInfo[];
-			return Array.isArray(characters) ? characters.slice(0, 5) : []; // Limit to 5 characters max
+			// Try to extract JSON from the response (handle cases where model includes extra text)
+			const jsonMatch = result.match(/\[[\s\S]*\]/);
+			if (jsonMatch) {
+				const characters = JSON.parse(jsonMatch[0]) as CharacterInfo[];
+				return Array.isArray(characters) ? characters.slice(0, 5) : []; // Limit to 5 characters max
+			} else {
+				// Try parsing the whole response as JSON
+				const characters = JSON.parse(result) as CharacterInfo[];
+				return Array.isArray(characters) ? characters.slice(0, 5) : [];
+			}
 		} catch (parseError) {
 			// If JSON parsing fails, try to extract character info manually
 			console.warn('Failed to parse character JSON, attempting manual extraction');
+			console.log('Parse error:', parseError);
 			return extractCharactersManually(result);
 		}
 		
@@ -286,7 +352,7 @@ function extractCharactersManually(text: string): CharacterInfo[] {
 	return characters.slice(0, 3); // Limit to 3 characters
 }
 
-async function summarizeContent(content: string, ai: Ai): Promise<string> {
+async function summarizeContent(content: string, openrouterApiKey: string): Promise<string> {
 	try {
 		const truncatedContent = content.length > 2000 ? content.substring(0, 2000) + '...' : content;
 		
@@ -307,7 +373,8 @@ async function summarizeContent(content: string, ai: Ai): Promise<string> {
 
 请提供简洁的总结：`;
 		
-		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
+		const requestBody = {
+			model: 'mistralai/mistral-large-2411',
 			messages: [
 				{
 					role: 'user',
@@ -315,9 +382,25 @@ async function summarizeContent(content: string, ai: Ai): Promise<string> {
 				}
 			],
 			max_tokens: 250
-		}) as any;
+		};
 		
-		const result = response.response as string;
+		const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+			method: 'POST',
+			headers: {
+				'Authorization': `Bearer ${openrouterApiKey}`,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify(requestBody)
+		});
+		
+		if (!response.ok) {
+			const errorText = await response.text();
+			console.error('summarizeContent OpenRouter API error:', response.status, response.statusText, errorText);
+			throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
+		}
+		
+		const responseData = await response.json() as any;
+		const result = responseData.choices[0].message.content;
 		
 		// Clean up the summary
 		const cleanedSummary = result
@@ -334,7 +417,7 @@ async function summarizeContent(content: string, ai: Ai): Promise<string> {
 	}
 }
 
-async function analyzeContentForTags(content: string, ai: Ai): Promise<string[]> {
+async function analyzeContentForTags(content: string, openrouterApiKey: string): Promise<string[]> {
 	try {
 		const truncatedContent = content.length > 1500 ? content.substring(0, 1500) + '...' : content;
 		
@@ -344,17 +427,32 @@ async function analyzeContentForTags(content: string, ai: Ai): Promise<string[]>
 
 只返回标签名称，每行一个，不需要解释。`;
 		
-		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
-			messages: [
-				{
-					role: 'user',
-					content: prompt
-				}
-			],
-			max_tokens: 100
-		}) as any;
+		const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+			method: 'POST',
+			headers: {
+				'Authorization': `Bearer ${openrouterApiKey}`,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				model: 'mistralai/mistral-large-2411',
+				messages: [
+					{
+						role: 'user',
+						content: prompt
+					}
+				],
+				max_tokens: 100
+			})
+		});
 		
-		const result = response.response as string;
+		if (!response.ok) {
+			const errorText = await response.text();
+			console.error('analyzeContentForTags OpenRouter API error:', response.status, response.statusText, errorText);
+			throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
+		}
+		
+		const responseData = await response.json() as any;
+		const result = responseData.choices[0].message.content;
 		
 		// Parse the response to extract tag names
 		const rawTags = result
@@ -550,7 +648,7 @@ async function generateContentWithContext(
 	contentSummary: string,
 	relatedSnippets: RelatedSnippetWithContent[],
 	detectedTags: string[],
-	ai: Ai,
+	openrouterApiKey: string,
 	maxLength: number = 800
 ): Promise<string> {
 	try {
@@ -561,67 +659,71 @@ async function generateContentWithContext(
 			).join('\n')
 			: '(未检测到明确角色信息)';
 		
-		// Prepare related snippets text (limit to avoid token overflow)
+		// Prepare related snippets text (use full content)
 		const snippetsText = relatedSnippets
-			.slice(0, 4) // Use top 4 most relevant snippets
+			.slice(0, 3) // Use top 3 most relevant snippets
 			.map((snippet, index) => {
-				const content = snippet.content && snippet.content.length > 250 
-					? snippet.content.substring(0, 250) + '...' 
-					: snippet.content;
-				return `[参考片段${index + 1}] 《${snippet.title}》作者：${snippet.author}\n标签：${snippet.tagNames?.join('、') || ''}\n内容：${content}`;
+				return `[参考片段${index + 1}] 《${snippet.title}》作者：${snippet.author}\n标签：${snippet.tagNames?.join('、') || ''}\n内容：${snippet.content}`;
 			})
 			.join('\n\n');
 		
 		const tagsText = detectedTags.join('、');
 		
-		const enhancedPrompt = `你是一个专业的情色文学创作助手。你的主要任务是将参考片段中的性爱内容和情色元素融入到基于内容摘要的故事延续中。
+		const enhancedPrompt = `你是情色文学创作助手。参考以下性爱片段创作内容，忽略其他非性爱因素。
 
-**性爱参考片段（核心内容来源）：**
+**性爱参考片段：**
 ${snippetsText || '(无相关片段)'}
 
-**从参考片段中提取和应用：**
-1. **性爱行为和技巧** - 直接采用参考片段中的具体性行为、姿势、前戏方式
-2. **身体描写和感官细节** - 学习参考片段中的身体部位描述、触觉、视觉、听觉感受
-3. **情色氛围营造** - 模仿参考片段如何建立性张力、渲染欲望和激情
-4. **性爱对话和呻吟** - 采用参考片段中的情色对话风格、床笫之言、情欲表达
-5. **情感与肉体结合** - 学习参考片段如何将情感深度与肉体欢愉相结合
+**角色：** ${charactersText}
+**背景：** ${contentSummary}
 
-**故事基础信息：**
-- **角色设定**：${charactersText}
-- **故事背景**：${contentSummary}
+**任务：直接参考片段中的性爱内容进行创作**
+- 使用片段中的性行为、身体描写、情色对话
+- 简单过渡后重点写性爱场景
+- 忽略非性爱的日常内容
 
-**创作核心任务：**
-1. **性爱场景转换** - 从摘要的非性内容自然过渡到参考片段中的性爱情节
-2. **角色性化处理** - 将摘要中的角色融入到参考片段的性爱场景中，保持角色特征但加入性魅力
-3. **情节性爱化** - 将故事情节发展导向性爱，参考片段提供具体的性行为内容
-4. **氛围渲染** - 建立从日常到情色的氛围转换，营造性张力和欲望
+**要求：**
+- 400-800字
+- 包含具体性爱行为和身体描写
+- 参考片段的激情程度
 
-**具体创作指导：**
-- **首要任务**：将参考片段中的性爱内容作为故事发展的目标和方向
-- **过渡技巧**：巧妙地从摘要情节过渡到参考片段的性爱场景
-- **内容融合**：使用摘要的角色和背景，但情节发展必须走向参考片段中的性爱内容
-- **激情程度**：匹配参考片段的性爱激烈程度和表达尺度
-
-**输出要求：**
-- 长度：400-800字
-- 语言：流畅的中文，富有情色表现力
-- 结构：从故事延续开始，逐步升温到性爱高潮
-- 内容：必须包含具体的性爱行为和身体描写
-- 重点：让读者感受到从日常故事自然发展到激情性爱的完整过程
-
-请创作从故事背景过渡到性爱场景的完整内容：`;
+请创作性爱内容：`;
+		console.log('enhancedPrompt', enhancedPrompt);
 		
-		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
+		// Debug API key
+		console.log('API Key length:', openrouterApiKey?.length || 0);
+		console.log('API Key prefix:', openrouterApiKey?.substring(0, 10) || 'undefined');
+		
+		const requestBody = {
+			model: 'deepseek/deepseek-chat-v3-0324',
 			messages: [
 				{
 					role: 'user',
 					content: enhancedPrompt
 				}
 			],
-			max_tokens: Math.min(maxLength * 2, 1500) // Allow some buffer for Chinese tokens
-		}) as any;
+			// max_tokens: Math.min(maxLength * 2, 1500)
+		};
 		
-		const generatedText = response.response as string;
+		console.log('OpenRouter request:', JSON.stringify(requestBody, null, 2));
+		
+		const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+			method: 'POST',
+			headers: {
+				'Authorization': `Bearer ${openrouterApiKey}`,
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify(requestBody)
+		});
+		
+		if (!response.ok) {
+			const errorText = await response.text();
+			console.error('OpenRouter API error:', response.status, response.statusText, errorText);
+			throw new Error(`OpenRouter API error: ${response.status} ${response.statusText} - ${errorText}`);
+		}
+		
+		const responseData = await response.json() as any;
+		const generatedText = responseData.choices[0].message.content;
 		
 		// Clean up the generated content
 		const cleanedContent = generatedText
@@ -630,6 +732,7 @@ ${snippetsText || '(无相关片段)'}
 			.replace(/\n{3,}/g, '\n\n') // Limit consecutive newlines
 			.substring(0, maxLength); // Ensure length limit
 		
+		console.log('cleanedContent', cleanedContent);
 		return cleanedContent;
 		
 	} catch (error) {
