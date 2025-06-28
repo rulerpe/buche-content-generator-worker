@@ -1,20 +1,80 @@
 # Buche Content Generator Worker
 
-AI-powered content generation worker that creates relevant erotic content based on input text and related tagged content from the database. Integrates with the **queue-based tagging system** from buche-tag-worker.
+AI-powered content generation worker with **WebSocket streaming support** that creates relevant erotic content based on input text and related tagged content from the database. Features real-time generation progress and handles long-running AI operations with Durable Objects.
 
 ## Features
 
+### Core Generation
 - **Content Analysis**: Automatically analyzes input text to detect relevant tags
 - **Smart Content Matching**: Finds related content from database based on tags
 - **Character Consistency**: Maintains characters and context from input text
 - **Style Preservation**: Generates content that matches the original writing style
 - **Chinese Language Focus**: Optimized for Chinese erotic content generation
 
+### WebSocket Streaming (NEW)
+- **Real-time Generation**: Stream content as it's generated with progress updates
+- **Long-running Operations**: Handles 26+ second generation times with Durable Objects
+- **Timeout Resolution**: Solves Cloudflare Workers 15-second timeout limitations
+- **Live Progress**: See character extraction, summarization, tagging, and generation steps
+- **Proper UTF-8 Handling**: Robust Chinese character streaming without corruption
+
+### Technical Features
+- **Durable Objects**: Hibernating objects for efficient long-running operations
+- **OpenRouter Integration**: Advanced AI models (DeepSeek Chat v3, Mistral Large)
+- **SSE Parsing**: Proper Server-Sent Events parsing with buffering and error handling
+- **Backward Compatibility**: Traditional REST API still available alongside streaming
+
 ## API Endpoints
+
+### WebSocket /generate-stream (NEW)
+
+**Real-time streaming content generation via WebSocket connection.**
+
+Connect to WebSocket endpoint and send generation request:
+
+```javascript
+// Connect to WebSocket
+const ws = new WebSocket('ws://localhost:8787/generate-stream');
+
+// Send generation request
+ws.onopen = () => {
+  ws.send(JSON.stringify({
+    "content": "你的输入文本内容...",
+    "tags": ["标签1", "标签2"],
+    "maxLength": 800
+  }));
+};
+
+// Receive real-time updates
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  
+  switch(data.type) {
+    case 'status':
+      console.log('Progress:', data.message);
+      break;
+    case 'stream':
+      console.log('Content chunk:', data.chunk);
+      break;
+    case 'complete':
+      console.log('Final result:', data.data);
+      break;
+    case 'error':
+      console.error('Error:', data.message);
+      break;
+  }
+};
+```
+
+**Streaming Messages:**
+- `status`: Progress updates ("Extracting characters...", "Generating content...")  
+- `stream`: Real-time content chunks as they're generated
+- `complete`: Final result with all metadata
+- `error`: Error messages if generation fails
 
 ### POST /generate
 
-Generates new content based on input text and optional tags.
+**Traditional API endpoint for non-streaming generation.**
 
 **Request Body:**
 ```json
@@ -58,7 +118,28 @@ Returns worker status and database statistics.
 }
 ```
 
-## Usage Example
+## Usage Examples
+
+### WebSocket Streaming (Recommended)
+
+```javascript
+// Real-time streaming generation
+const ws = new WebSocket('ws://localhost:8787/generate-stream');
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({
+    "content": "她轻抚着他的脸颊，眼中满含温柔...",
+    "maxLength": 600
+  }));
+};
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log(`[${data.type}]`, data.message || data.chunk);
+};
+```
+
+### Traditional REST API
 
 ```bash
 # Generate content based on input text
@@ -101,11 +182,25 @@ npm run cf-typegen
 ## Dependencies
 
 This worker requires:
-- Cloudflare D1 database with tagged content
-- Cloudflare R2 bucket with content snippets  
-- Cloudflare AI binding for content generation
+- **Cloudflare D1 database** with tagged content
+- **Cloudflare R2 bucket** with content snippets  
+- **OpenRouter API key** for advanced AI model access (DeepSeek, Mistral)
+- **Durable Objects** binding for WebSocket streaming support
 - Existing content from buche-data-collect-worker
-- **Tags from buche-tag-worker** (preferably processed via the new queue-based system)
+- **Tags from buche-tag-worker** (preferably processed via the queue-based system)
+
+### Configuration
+
+Set up your OpenRouter API key:
+```bash
+# Set OpenRouter API key as secret
+wrangler secret put OPENROUTER_API_KEY
+
+# Or set in wrangler.jsonc for development
+"vars": {
+  "OPENROUTER_API_KEY": "your-openrouter-api-key"
+}
+```
 
 ## Integration with Queue-Based Tagging
 
@@ -127,10 +222,20 @@ curl -X POST https://buche-tag-worker.workers.dev/tag-queue
 # 3. Monitor tagging progress
 curl https://buche-tag-worker.workers.dev/queue-status
 
-# 4. Generate content once tagging is complete
+# 4. Generate content with streaming (recommended)
+# Connect WebSocket to: wss://buche-content-generator-worker.workers.dev/generate-stream
+
+# Or use traditional API
 curl -X POST https://buche-content-generator-worker.workers.dev/generate \
   -H "Content-Type: application/json" \
   -d '{"content": "你的输入文本..."}'
 ```
 
 The queue-based system ensures that all content is properly tagged before content generation, providing better matching and more relevant results.
+
+## Performance Notes
+
+- **WebSocket Streaming**: Recommended for production use, handles long generation times gracefully
+- **Traditional API**: May timeout on complex generations (15-second Cloudflare Workers limit)
+- **Generation Time**: Typically 26+ seconds for full content generation with multiple AI calls
+- **Durable Objects**: Automatically hibernate during AI API calls to minimize costs
