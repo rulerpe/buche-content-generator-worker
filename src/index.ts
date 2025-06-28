@@ -68,6 +68,8 @@ interface Snippet {
 }
 
 
+// Note: RPC entrypoint removed - using traditional service binding for WebSocket support
+
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
@@ -151,6 +153,8 @@ interface RelatedSnippetWithContent extends RelatedSnippet {
 	content?: string;
 	tagNames?: string[];
 }
+
+// RPC handler removed - using traditional service binding approach
 
 
 
