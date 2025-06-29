@@ -169,7 +169,14 @@ export class ContentGeneratorDO extends DurableObject {
 			// Step 1: Extract characters
 			await sendSSEEvent('status', { message: 'Extracting characters from content...' });
 
-			const extractedCharacters = await this.extractCharacters(request.content, env.OPENROUTER_API_KEY);
+			let extractedCharacters: CharacterInfo[] = [];
+			try {
+				extractedCharacters = await this.extractCharacters(request.content, env.OPENROUTER_API_KEY);
+				console.log('Character extraction completed successfully:', extractedCharacters.length, 'characters found');
+			} catch (error) {
+				console.error('Character extraction failed, continuing with empty characters:', error);
+				// Continue with empty characters array instead of failing
+			}
 			
 			await sendSSEEvent('progress', {
 				step: 'characters',
@@ -783,22 +790,46 @@ ${snippetsText || '(无相关片段)'}
 			const responseData = await response.json() as any;
 			const result = responseData.choices[0].message.content;
 			
+			// Enhanced logging for debugging
+			console.log('Character extraction - Raw AI response:', JSON.stringify({
+				model: 'mistralai/mistral-large-2411',
+				response_length: result.length,
+				response_preview: result.substring(0, 200),
+				full_response: result
+			}));
+			
 			try {
 				const jsonMatch = result.match(/\[[\s\S]*\]/);
 				if (jsonMatch) {
+					console.log('Found JSON array match:', jsonMatch[0]);
 					const characters = JSON.parse(jsonMatch[0]) as CharacterInfo[];
+					console.log('Successfully parsed characters:', characters);
 					return Array.isArray(characters) ? characters.slice(0, 5) : [];
 				} else {
+					console.log('No JSON array found, trying to parse entire response as JSON');
 					const characters = JSON.parse(result) as CharacterInfo[];
+					console.log('Successfully parsed entire response as characters:', characters);
 					return Array.isArray(characters) ? characters.slice(0, 5) : [];
 				}
 			} catch (parseError) {
+				console.error('JSON parsing failed:', {
+					error: parseError instanceof Error ? parseError.message : String(parseError),
+					raw_response: result,
+					attempted_json_match: result.match(/\[[\s\S]*\]/)
+				});
 				console.warn('Failed to parse character JSON, attempting manual extraction');
-				return this.extractCharactersManually(result);
+				const manualCharacters = this.extractCharactersManually(result);
+				console.log('Manual extraction result:', manualCharacters);
+				return manualCharacters;
 			}
 			
 		} catch (error) {
-			console.error('Error extracting characters:', error);
+			console.error('Error extracting characters:', {
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+				content_preview: content.substring(0, 100)
+			});
+			// Return empty array instead of throwing, so generation can continue
 			return [];
 		}
 	}
