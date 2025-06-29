@@ -160,10 +160,35 @@ export class ContentGeneratorDO extends DurableObject {
 		const env = this.env as Env;
 		
 		try {
-			// Helper function to send SSE event
+			// Helper function to send SSE event with error handling
 			const sendSSEEvent = async (type: string, data: any) => {
-				const message = `data: ${JSON.stringify({ type, ...data })}\n\n`;
-				await writer.write(encoder.encode(message));
+				try {
+					const message = `data: ${JSON.stringify({ type, ...data })}\n\n`;
+					await writer.write(encoder.encode(message));
+					console.log(`SSE event sent successfully: ${type}`);
+				} catch (sseError) {
+					console.error(`Failed to send SSE event (${type}):`, {
+						error: sseError instanceof Error ? sseError.message : String(sseError),
+						type,
+						dataPreview: JSON.stringify(data).substring(0, 100)
+					});
+					// Don't throw here, continue with generation
+				}
+			};
+
+			// Send keepalive messages to prevent connection timeout
+			const keepAliveInterval = setInterval(async () => {
+				try {
+					await writer.write(encoder.encode(': keepalive\n\n'));
+				} catch (error) {
+					console.warn('Keepalive failed, connection may be closed');
+					clearInterval(keepAliveInterval);
+				}
+			}, 10000); // Every 10 seconds
+
+			// Ensure we clean up the interval
+			const cleanup = () => {
+				clearInterval(keepAliveInterval);
 			};
 
 			// Step 1: Extract characters
@@ -171,10 +196,19 @@ export class ContentGeneratorDO extends DurableObject {
 
 			let extractedCharacters: CharacterInfo[] = [];
 			try {
-				extractedCharacters = await this.extractCharacters(request.content, env.OPENROUTER_API_KEY);
+				console.log('Starting character extraction...');
+				extractedCharacters = await Promise.race([
+					this.extractCharacters(request.content, env.OPENROUTER_API_KEY),
+					new Promise<CharacterInfo[]>((_, reject) => 
+						setTimeout(() => reject(new Error('Character extraction timeout after 30 seconds')), 30000)
+					)
+				]);
 				console.log('Character extraction completed successfully:', extractedCharacters.length, 'characters found');
 			} catch (error) {
-				console.error('Character extraction failed, continuing with empty characters:', error);
+				console.error('Character extraction failed, continuing with empty characters:', {
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined
+				});
 				// Continue with empty characters array instead of failing
 			}
 			
@@ -188,10 +222,19 @@ export class ContentGeneratorDO extends DurableObject {
 
 			let contentSummary = '';
 			try {
-				contentSummary = await this.summarizeContent(request.content, env.OPENROUTER_API_KEY);
+				console.log('Starting content summarization...');
+				contentSummary = await Promise.race([
+					this.summarizeContent(request.content, env.OPENROUTER_API_KEY),
+					new Promise<string>((_, reject) => 
+						setTimeout(() => reject(new Error('Content summarization timeout after 30 seconds')), 30000)
+					)
+				]);
 				console.log('Content summarization completed successfully, length:', contentSummary.length);
 			} catch (error) {
-				console.error('Content summarization failed, continuing with empty summary:', error);
+				console.error('Content summarization failed, continuing with empty summary:', {
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined
+				});
 				// Continue with empty summary instead of failing
 			}
 			
@@ -205,10 +248,20 @@ export class ContentGeneratorDO extends DurableObject {
 
 			let detectedTags: string[] = [];
 			try {
-				detectedTags = await this.analyzeContentForTags(request.content, env.OPENROUTER_API_KEY);
+				console.log('Starting tag analysis...');
+				// Add timeout to prevent hanging
+				detectedTags = await Promise.race([
+					this.analyzeContentForTags(request.content, env.OPENROUTER_API_KEY),
+					new Promise<string[]>((_, reject) => 
+						setTimeout(() => reject(new Error('Tag analysis timeout after 30 seconds')), 30000)
+					)
+				]);
 				console.log('Tag analysis completed successfully, detected tags:', detectedTags);
 			} catch (error) {
-				console.error('Tag analysis failed, continuing with empty tags:', error);
+				console.error('Tag analysis failed, continuing with empty tags:', {
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined
+				});
 				// Continue with empty detected tags instead of failing
 			}
 			
@@ -225,10 +278,19 @@ export class ContentGeneratorDO extends DurableObject {
 
 			let relatedSnippets: any[] = [];
 			try {
-				relatedSnippets = await this.findRelatedSnippetsWithDedup(uniqueTags, env, 2);
+				console.log('Starting related snippets search...');
+				relatedSnippets = await Promise.race([
+					this.findRelatedSnippetsWithDedup(uniqueTags, env, 2),
+					new Promise<any[]>((_, reject) => 
+						setTimeout(() => reject(new Error('Related snippets search timeout after 30 seconds')), 30000)
+					)
+				]);
 				console.log('Related snippets search completed successfully, found:', relatedSnippets.length, 'snippets');
 			} catch (error) {
-				console.error('Related snippets search failed, continuing with empty snippets:', error);
+				console.error('Related snippets search failed, continuing with empty snippets:', {
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined
+				});
 				// Continue with empty snippets instead of failing
 			}
 			
@@ -286,14 +348,33 @@ export class ContentGeneratorDO extends DurableObject {
 			});
 
 		} catch (error) {
-			console.error('Generation SSE error:', error);
-			const errorMessage = `data: ${JSON.stringify({
-				type: 'error',
-				message: error instanceof Error ? error.message : String(error)
-			})}\n\n`;
-			await writer.write(encoder.encode(errorMessage));
+			console.error('Generation SSE error:', {
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+				timestamp: new Date().toISOString()
+			});
+			
+			// Cleanup keepalive interval
+			cleanup();
+			
+			try {
+				const errorMessage = `data: ${JSON.stringify({
+					type: 'error',
+					message: error instanceof Error ? error.message : String(error)
+				})}\n\n`;
+				await writer.write(encoder.encode(errorMessage));
+			} catch (writeError) {
+				console.error('Failed to write error message to SSE stream:', writeError);
+			}
 		} finally {
-			await writer.close();
+			// Cleanup keepalive interval
+			cleanup();
+			
+			try {
+				await writer.close();
+			} catch (closeError) {
+				console.error('Failed to close SSE writer:', closeError);
+			}
 		}
 	}
 

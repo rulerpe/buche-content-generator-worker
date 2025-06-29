@@ -74,6 +74,10 @@ export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 		
+		// Handle CORS preflight requests
+		if (request.method === 'OPTIONS') {
+			return handleCORS(request);
+		}
 		
 		if (url.pathname === '/generate-stream') {
 			return handleStreamingGeneration(request, env);
@@ -94,10 +98,27 @@ export default {
 // Export the Durable Object class
 export { ContentGeneratorDO };
 
+// CORS handler for preflight requests
+function handleCORS(request: Request): Response {
+	const corsHeaders = {
+		'Access-Control-Allow-Origin': '*',
+		'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+		'Access-Control-Allow-Headers': 'Content-Type, Upgrade, Connection, Sec-WebSocket-Key, Sec-WebSocket-Version, Sec-WebSocket-Protocol',
+		'Access-Control-Max-Age': '86400'
+	};
+	
+	return new Response(null, {
+		status: 204,
+		headers: corsHeaders
+	});
+}
+
 async function handleStreamingGeneration(request: Request, env: Env): Promise<Response> {
 	const upgradeHeader = request.headers.get('Upgrade');
 	if (!upgradeHeader || upgradeHeader !== 'websocket') {
-		return new Response('Upgrade: websocket required', { status: 426 });
+		return new Response('Upgrade: websocket required', { status: 426, headers: {
+			'Access-Control-Allow-Origin': '*'
+		} });
 	}
 
 	// Create a unique ID for this generation session
@@ -105,17 +126,36 @@ async function handleStreamingGeneration(request: Request, env: Env): Promise<Re
 	const durableObjectId = env.CONTENT_GENERATOR_DO.idFromName(sessionId);
 	const durableObjectStub = env.CONTENT_GENERATOR_DO.get(durableObjectId);
 
-	// Forward the WebSocket request to the Durable Object
+	// Forward the WebSocket request to the Durable Object with CORS headers
 	const newUrl = new URL(request.url);
 	newUrl.pathname = '/websocket';
 	
+	// Add CORS headers to the forwarded request
+	const headers = new Headers(request.headers);
+	headers.set('Access-Control-Allow-Origin', '*');
+	
 	const newRequest = new Request(newUrl.toString(), {
 		method: request.method,
-		headers: request.headers,
+		headers: headers,
 		body: request.body
 	});
 
-	return durableObjectStub.fetch(newRequest);
+	const response = await durableObjectStub.fetch(newRequest);
+	
+	// Add CORS headers to the response if it's a WebSocket upgrade
+	if (response.status === 101) {
+		const newHeaders = new Headers(response.headers);
+		newHeaders.set('Access-Control-Allow-Origin', '*');
+		
+		return new Response(response.body, {
+			status: response.status,
+			statusText: response.statusText,
+			headers: newHeaders,
+			webSocket: response.webSocket
+		});
+	}
+	
+	return response;
 }
 
 async function handleSSEGeneration(request: Request, env: Env): Promise<Response> {
