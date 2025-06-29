@@ -79,6 +79,10 @@ export default {
 			return handleStreamingGeneration(request, env);
 		}
 		
+		if (url.pathname === '/generate-stream-sse') {
+			return handleSSEGeneration(request, env);
+		}
+		
 		if (url.pathname === '/status') {
 			return handleStatus(env);
 		}
@@ -114,6 +118,29 @@ async function handleStreamingGeneration(request: Request, env: Env): Promise<Re
 	return durableObjectStub.fetch(newRequest);
 }
 
+async function handleSSEGeneration(request: Request, env: Env): Promise<Response> {
+	// Handle SSE (Server-Sent Events) streaming for better service binding compatibility
+	if (request.method !== 'POST') {
+		return new Response('POST method required', { status: 405 });
+	}
+
+	// Create a unique ID for this generation session
+	const sessionId = crypto.randomUUID();
+	const durableObjectId = env.CONTENT_GENERATOR_DO.idFromName(sessionId);
+	const durableObjectStub = env.CONTENT_GENERATOR_DO.get(durableObjectId);
+
+	// Forward the SSE request to the Durable Object
+	const newUrl = new URL(request.url);
+	newUrl.pathname = '/sse';
+	
+	const newRequest = new Request(newUrl.toString(), {
+		method: request.method,
+		headers: request.headers,
+		body: request.body
+	});
+
+	return durableObjectStub.fetch(newRequest);
+}
 
 async function handleStatus(env: Env): Promise<Response> {
 	try {

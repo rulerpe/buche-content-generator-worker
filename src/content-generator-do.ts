@@ -55,7 +55,11 @@ export class ContentGeneratorDO extends DurableObject {
 			return this.handleWebSocket(request);
 		}
 		
-		return new Response('ContentGeneratorDO - Use /websocket endpoint', { status: 400 });
+		if (url.pathname === '/sse') {
+			return this.handleSSE(request);
+		}
+		
+		return new Response('ContentGeneratorDO - Use /websocket or /sse endpoint', { status: 400 });
 	}
 
 	async handleWebSocket(request: Request): Promise<Response> {
@@ -71,6 +75,47 @@ export class ContentGeneratorDO extends DurableObject {
 			status: 101,
 			webSocket: client
 		});
+	}
+
+	async handleSSE(request: Request): Promise<Response> {
+		if (request.method !== 'POST') {
+			return new Response('POST method required', { status: 405 });
+		}
+
+		try {
+			const body = await request.text();
+			const requestData = JSON.parse(body) as ContentGenerationRequest;
+
+			// Create a ReadableStream for SSE
+			const { readable, writable } = new TransformStream();
+			const writer = writable.getWriter();
+			const encoder = new TextEncoder();
+
+			// Start the generation process
+			this.generateContentSSE(writer, encoder, requestData);
+
+			return new Response(readable, {
+				headers: {
+					'Content-Type': 'text/event-stream',
+					'Cache-Control': 'no-cache',
+					'Connection': 'keep-alive',
+					'Access-Control-Allow-Origin': '*',
+					'Access-Control-Allow-Headers': 'Cache-Control'
+				}
+			});
+
+		} catch (error) {
+			console.error('SSE handler error:', error);
+			return new Response(JSON.stringify({
+				error: error instanceof Error ? error.message : String(error)
+			}), {
+				status: 500,
+				headers: {
+					'Content-Type': 'application/json',
+					'Access-Control-Allow-Origin': '*'
+				}
+			});
+		}
 	}
 
 	async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -104,6 +149,111 @@ export class ContentGeneratorDO extends DurableObject {
 			ws.send(JSON.stringify(data));
 		} catch (error) {
 			console.error('Error sending WebSocket message:', error);
+		}
+	}
+
+	private async generateContentSSE(
+		writer: WritableStreamDefaultWriter<Uint8Array>,
+		encoder: TextEncoder,
+		request: ContentGenerationRequest
+	): Promise<void> {
+		const env = this.env as Env;
+		
+		try {
+			// Helper function to send SSE event
+			const sendSSEEvent = async (type: string, data: any) => {
+				const message = `data: ${JSON.stringify({ type, ...data })}\n\n`;
+				await writer.write(encoder.encode(message));
+			};
+
+			// Step 1: Extract characters
+			await sendSSEEvent('status', { message: 'Extracting characters from content...' });
+
+			const extractedCharacters = await this.extractCharacters(request.content, env.OPENROUTER_API_KEY);
+			
+			await sendSSEEvent('progress', {
+				step: 'characters',
+				data: extractedCharacters
+			});
+
+			// Step 2: Summarize content
+			await sendSSEEvent('status', { message: 'Creating content summary...' });
+
+			const contentSummary = await this.summarizeContent(request.content, env.OPENROUTER_API_KEY);
+			
+			await sendSSEEvent('progress', {
+				step: 'summary',
+				data: contentSummary
+			});
+
+			// Step 3: Analyze for tags
+			await sendSSEEvent('status', { message: 'Analyzing content for relevant tags...' });
+
+			const detectedTags = await this.analyzeContentForTags(request.content, env.OPENROUTER_API_KEY);
+			const allTags = [...(request.tags || []), ...detectedTags];
+			const uniqueTags = [...new Set(allTags)];
+
+			await sendSSEEvent('progress', {
+				step: 'tags',
+				data: uniqueTags
+			});
+
+			// Step 4: Find related snippets
+			await sendSSEEvent('status', { message: 'Finding related content snippets...' });
+
+			const relatedSnippets = await this.findRelatedSnippetsWithDedup(uniqueTags, env, 2);
+			
+			await sendSSEEvent('progress', {
+				step: 'snippets',
+				data: relatedSnippets.map(snippet => ({
+					id: snippet.id,
+					title: snippet.title,
+					author: snippet.author,
+					tags: snippet.tagNames || [],
+					relevanceScore: snippet.relevanceScore || 0
+				}))
+			});
+
+			// Step 5: Generate content with streaming
+			await sendSSEEvent('status', { message: 'Generating new content...' });
+
+			const generatedContent = await this.generateContentWithSSEStreaming(
+				sendSSEEvent,
+				extractedCharacters,
+				contentSummary,
+				relatedSnippets,
+				uniqueTags,
+				env.OPENROUTER_API_KEY,
+				request.maxLength || 800
+			);
+
+			// Send final result
+			await sendSSEEvent('complete', {
+				data: {
+					success: true,
+					generatedContent,
+					extractedCharacters,
+					contentSummary,
+					detectedTags,
+					relatedSnippets: relatedSnippets.map(snippet => ({
+						id: snippet.id,
+						title: snippet.title,
+						author: snippet.author,
+						tags: snippet.tagNames || [],
+						relevanceScore: snippet.relevanceScore || 0
+					}))
+				}
+			});
+
+		} catch (error) {
+			console.error('Generation SSE error:', error);
+			const errorMessage = `data: ${JSON.stringify({
+				type: 'error',
+				message: error instanceof Error ? error.message : String(error)
+			})}\n\n`;
+			await writer.write(encoder.encode(errorMessage));
+		} finally {
+			await writer.close();
 		}
 	}
 
@@ -400,6 +550,184 @@ ${snippetsText || '(无相关片段)'}
 		} catch (error) {
 			console.error('Error generating content with streaming:', error);
 			throw new Error('Failed to generate content with streaming');
+		}
+	}
+
+	private async generateContentWithSSEStreaming(
+		sendSSEEvent: (type: string, data: any) => Promise<void>,
+		extractedCharacters: CharacterInfo[],
+		contentSummary: string,
+		relatedSnippets: RelatedSnippetWithContent[],
+		detectedTags: string[],
+		openrouterApiKey: string,
+		maxLength: number = 800
+	): Promise<string> {
+		try {
+			// Prepare content for generation (same as WebSocket version)
+			const charactersText = extractedCharacters.length > 0 
+				? extractedCharacters.map(char => 
+					`${char.name}：${char.relationship || '未知关系'}，特征：${char.attributes.join('、')}，角色：${char.role || '未知'}`
+				).join('\n')
+				: '(未检测到明确角色信息)';
+			
+			const snippetsText = relatedSnippets
+				.slice(0, 3)
+				.map((snippet, index) => {
+					return `[参考片段${index + 1}] 《${snippet.title}》作者：${snippet.author}\n标签：${snippet.tagNames?.join('、') || ''}\n内容：${snippet.content}`;
+				})
+				.join('\n\n');
+			
+			const enhancedPrompt = `参考以下片段，直接创作情色内容，不要任何说明或解释。
+
+**参考片段：**
+${snippetsText || '(无相关片段)'}
+
+**角色：** ${charactersText}
+**背景：** ${contentSummary}
+
+要求：400-800字，直接开始故事内容，不要前言后语。
+
+---
+
+`;
+
+			const requestBody = {
+				model: 'deepseek/deepseek-chat-v3-0324',
+				messages: [
+					{
+						role: 'user',
+						content: enhancedPrompt
+					}
+				],
+				stream: true // Enable streaming
+			};
+
+			const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+				method: 'POST',
+				headers: {
+					'Authorization': `Bearer ${openrouterApiKey}`,
+					'Content-Type': 'application/json'
+				},
+				body: JSON.stringify(requestBody)
+			});
+
+			if (!response.ok) {
+				const errorText = await response.text();
+				throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
+			}
+
+			let generatedContent = '';
+			let buffer = ''; // Buffer for incomplete SSE events
+			const reader = response.body?.getReader();
+			const decoder = new TextDecoder();
+			
+			if (!reader) {
+				throw new Error('Failed to get response stream reader');
+			}
+
+			try {
+				while (true) {
+					const { done, value } = await reader.read();
+					
+					if (done) break;
+					
+					// Decode chunk and add to buffer
+					const chunk = decoder.decode(value, { stream: true });
+					buffer += chunk;
+					
+					// Process complete SSE events (separated by double newlines)
+					const events = buffer.split('\n\n');
+					
+					// Keep the last incomplete event in buffer
+					buffer = events.pop() || '';
+					
+					for (const event of events) {
+						if (!event.trim()) continue;
+						
+						const lines = event.split('\n');
+						let dataLine = '';
+						
+						for (const line of lines) {
+							if (line.startsWith(':')) {
+								continue;
+							}
+							
+							if (line.startsWith('data: ')) {
+								dataLine = line.slice(6);
+								break;
+							}
+						}
+						
+						if (!dataLine) continue;
+						
+						if (dataLine === '[DONE]') {
+							break;
+						}
+						
+						try {
+							const parsed = JSON.parse(dataLine);
+							const content = parsed.choices?.[0]?.delta?.content;
+							
+							if (content) {
+								generatedContent += content;
+								
+								// Stream content chunk to client via SSE
+								await sendSSEEvent('stream', {
+									chunk: content,
+									total: generatedContent
+								});
+							}
+						} catch (parseError) {
+							console.warn('Failed to parse SSE JSON:', dataLine, parseError);
+							continue;
+						}
+					}
+				}
+				
+				// Process any remaining data in buffer
+				if (buffer.trim()) {
+					const lines = buffer.split('\n');
+					for (const line of lines) {
+						if (line.startsWith('data: ')) {
+							const dataLine = line.slice(6);
+							if (dataLine !== '[DONE]') {
+								try {
+									const parsed = JSON.parse(dataLine);
+									const content = parsed.choices?.[0]?.delta?.content;
+									
+									if (content) {
+										generatedContent += content;
+										
+										await sendSSEEvent('stream', {
+											chunk: content,
+											total: generatedContent
+										});
+									}
+								} catch (parseError) {
+									console.warn('Failed to parse remaining SSE JSON:', dataLine, parseError);
+								}
+							}
+							break;
+						}
+					}
+				}
+				
+			} finally {
+				reader.releaseLock();
+			}
+
+			// Clean up the generated content
+			const cleanedContent = generatedContent
+				.trim()
+				.replace(/^[\"'"""'']+|[\"'"""'']+$/g, '')
+				.replace(/\n{3,}/g, '\n\n')
+				.substring(0, maxLength);
+
+			return cleanedContent;
+
+		} catch (error) {
+			console.error('Error generating content with SSE streaming:', error);
+			throw new Error('Failed to generate content with SSE streaming');
 		}
 	}
 
