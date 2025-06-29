@@ -186,7 +186,14 @@ export class ContentGeneratorDO extends DurableObject {
 			// Step 2: Summarize content
 			await sendSSEEvent('status', { message: 'Creating content summary...' });
 
-			const contentSummary = await this.summarizeContent(request.content, env.OPENROUTER_API_KEY);
+			let contentSummary = '';
+			try {
+				contentSummary = await this.summarizeContent(request.content, env.OPENROUTER_API_KEY);
+				console.log('Content summarization completed successfully, length:', contentSummary.length);
+			} catch (error) {
+				console.error('Content summarization failed, continuing with empty summary:', error);
+				// Continue with empty summary instead of failing
+			}
 			
 			await sendSSEEvent('progress', {
 				step: 'summary',
@@ -196,7 +203,15 @@ export class ContentGeneratorDO extends DurableObject {
 			// Step 3: Analyze for tags
 			await sendSSEEvent('status', { message: 'Analyzing content for relevant tags...' });
 
-			const detectedTags = await this.analyzeContentForTags(request.content, env.OPENROUTER_API_KEY);
+			let detectedTags: string[] = [];
+			try {
+				detectedTags = await this.analyzeContentForTags(request.content, env.OPENROUTER_API_KEY);
+				console.log('Tag analysis completed successfully, detected tags:', detectedTags);
+			} catch (error) {
+				console.error('Tag analysis failed, continuing with empty tags:', error);
+				// Continue with empty detected tags instead of failing
+			}
+			
 			const allTags = [...(request.tags || []), ...detectedTags];
 			const uniqueTags = [...new Set(allTags)];
 
@@ -208,7 +223,14 @@ export class ContentGeneratorDO extends DurableObject {
 			// Step 4: Find related snippets
 			await sendSSEEvent('status', { message: 'Finding related content snippets...' });
 
-			const relatedSnippets = await this.findRelatedSnippetsWithDedup(uniqueTags, env, 2);
+			let relatedSnippets: any[] = [];
+			try {
+				relatedSnippets = await this.findRelatedSnippetsWithDedup(uniqueTags, env, 2);
+				console.log('Related snippets search completed successfully, found:', relatedSnippets.length, 'snippets');
+			} catch (error) {
+				console.error('Related snippets search failed, continuing with empty snippets:', error);
+				// Continue with empty snippets instead of failing
+			}
 			
 			await sendSSEEvent('progress', {
 				step: 'snippets',
@@ -224,15 +246,26 @@ export class ContentGeneratorDO extends DurableObject {
 			// Step 5: Generate content with streaming
 			await sendSSEEvent('status', { message: 'Generating new content...' });
 
-			const generatedContent = await this.generateContentWithSSEStreaming(
-				sendSSEEvent,
-				extractedCharacters,
-				contentSummary,
-				relatedSnippets,
-				uniqueTags,
-				env.OPENROUTER_API_KEY,
-				request.maxLength || 800
-			);
+			let generatedContent = '';
+			try {
+				console.log('Starting content generation with streaming...');
+				generatedContent = await this.generateContentWithSSEStreaming(
+					sendSSEEvent,
+					extractedCharacters,
+					contentSummary,
+					relatedSnippets,
+					uniqueTags,
+					env.OPENROUTER_API_KEY,
+					request.maxLength || 800
+				);
+				console.log('Content generation completed successfully, length:', generatedContent.length);
+			} catch (error) {
+				console.error('Content generation with streaming failed:', {
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined
+				});
+				throw error; // Re-throw this error since it's the final step
+			}
 
 			// Send final result
 			await sendSSEEvent('complete', {
